@@ -1,5 +1,5 @@
 - name: Copy and Apply Kubernetes YAML
-  hosts: 192.168.137.135  
+  hosts: 192.168.137.135 
   gather_facts: false
   become: true
  
