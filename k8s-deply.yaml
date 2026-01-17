@@ -3,6 +3,7 @@ kind: Deployment
 metadata:
   name: front-container-deployment
 spec:
+
   replicas: 3
   selector:
     matchLabels:
