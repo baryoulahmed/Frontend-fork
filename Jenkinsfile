@@ -1,72 +1,127 @@
 pipeline {
     agent any
-    
-     environment {     
-	ANSIBLE_PLAYBOOK = 'ansible-deploy.yaml'
-        NEXUS_VERSION = "nexus3"
-        NEXUS_PROTOCOL = "http"
-        NEXUS_URL = "http://192.168.137.129:1111"
-        NEXUS_REPOSITORY = "back-end" 
-        NEXUS_CREDENTIAL_ID = "admin"
-        DOCKER_IMAGE_NAME = "front-end"
-	BUILD_NUMBER = "${BUILD_NUMBER}"
-        DOCKER_IMAGE_TAG = "${NEXUS_REPOSITORY}/${DOCKER_IMAGE_NAME}:${BUILD_NUMBER}" 
+
+    environment {
+        SONAR_SCANNER_VERSION = '4.7.0.2747'
+        SONAR_HOME = "${env.HOME}/.sonar/sonar-scanner-${SONAR_SCANNER_VERSION}-linux"
+        REPO_URL = 'https://github.com/baryoulahmed/Frontend-fork.git'
+        BRANCH = 'main'
+        DOCKER_IMAGE = 'baryoul/frontend-app'
+        SONAR_TOKEN = credentials('sonar-token-id')           // Jenkins secret
+        DOCKER_CREDENTIALS = 'docker-hub-credentials-id'     // Jenkins secret
+        DT_API_URL = 'http://192.168.79.148:8081'                 // Dependency-Track API no-auth
     }
+
     stages {
-        stage('Checkout Code') {
+
+        stage('Clone Repository') {
             steps {
-                // Checkout your source code from your Git repository
-                script {
-                    git branch: 'main', url: 'https://github.com/Wassim-Bessioud/PFE-Frontend.git'
-                }
-            }
-        }
-	stage('Build Docker Image') {
-            steps {
-                script {
-                    // Build the Docker image
-                    def customImage = docker.build("${DOCKER_IMAGE_TAG}")
-                }
+                deleteDir()
+                sh "git clone -b ${BRANCH} ${REPO_URL} repo"
             }
         }
 
-        stage('Push Docker Image to Nexus') {
+        stage('Install Dependencies') {
             steps {
-                script {
-                    // Log in to Docker registry
-                    docker.withRegistry("${NEXUS_URL}", "${NEXUS_CREDENTIAL_ID}") {
-                        // Push the Docker image to Nexus
-                        def customImage = docker.image("${DOCKER_IMAGE_TAG}")
-                        customImage.push()
+                dir('repo') {
+                    withEnv(["PATH=/usr/bin:/usr/local/bin:$PATH"]) {
+                        sh 'npm install -f'
                     }
                 }
             }
         }
-	    	stage('Ansible Deployment') {
+
+        stage('Build') {
             steps {
-                script {
-                    
-			sh "sed -i 's|<IMAGE_TAG>|${BUILD_NUMBER}|' k8s-deply.yaml"
-                    sh "ansible-playbook -i inventory.ini ${ANSIBLE_PLAYBOOK}"
+                dir('repo') {
+                    sh 'npm -v'
                 }
             }
         }
-	stage('Sonar Analysis') {
+
+        stage('Test') {
             steps {
-                script {
-                    nodejs(nodeJSInstallationName: 'Node') {
-                        sh "npm install"
-                        sh "npm install sonar-scanner"
-                        sh "npm run sonar"
+                dir('repo') {
+                    sh 'npm -v'
+                }
+            }
+        }
+
+        stage('Install Sonar Scanner') {
+            steps {
+                sh """
+                    mkdir -p \$HOME/.sonar
+                    if [ ! -d "\$SONAR_HOME" ]; then
+                        curl -sSLo \$HOME/.sonar/sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}-linux.zip
+                        unzip -o \$HOME/.sonar/sonar-scanner.zip -d \$HOME/.sonar/
+                    fi
+                """
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                dir('repo') {
+                    withSonarQubeEnv('SonarQube') {
+                        withEnv([
+                            "PATH+SONAR=${env.SONAR_HOME}/bin",
+                            "SONAR_SCANNER_OPTS=-server"
+                        ]) {
+                            sh 'sonar-scanner -Dsonar.login=$SONAR_TOKEN -Dsonar.projectKey=devSecOps -Dsonar.sources=. -Dsonar.host.url=http://192.168.79.148:9000'
+                        }
                     }
                 }
             }
-		
         }
-	     
-  
 
-      
-        
+        stage('Build & Push Docker Image') {
+            steps {
+                dir('repo') {
+                    script {
+                        def imageTag = "${env.BUILD_NUMBER}"
+
+                        // Login Docker Hub
+                        withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDENTIALS}", usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                            sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
+                        }
+
+                        // Build Docker image
+                        sh "docker build -t ${DOCKER_IMAGE}:${imageTag} ."
+
+                        // Push Docker image
+                        sh "docker push ${DOCKER_IMAGE}:${imageTag}"
+                    }
+                }
+            }
+        }
+
+        // ✅ Nouvelle étape : Dependency-Track BOM scan (no-auth)
+        stage('Generate BOM & Upload to Dependency-Track') {
+            steps {
+                script {
+                    def imageTag = "${env.BUILD_NUMBER}"
+
+                    // Installer syft si absent
+                    sh '''
+                        if ! command -v syft > /dev/null; then
+                            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+                        fi
+                    '''
+
+                    // Générer BOM depuis l'image Docker
+                    sh "syft docker:${DOCKER_IMAGE}:${imageTag} -o cyclonedx-json > bom.json"
+                    echo "BOM generated: bom.json"
+
+                    // Upload automatique vers Dependency-Track (no-auth)
+                    sh """
+                        curl -X POST "${DT_API_URL}/api/v1/bom" \\
+                             -F "projectName=Front" \\
+                             -F "bom=@bom.json"
+                    """
+                    echo "BOM uploaded to Dependency-Track successfully (no-auth)."
+                }
+            }
+        }
+
     }
 }
